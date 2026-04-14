@@ -2,10 +2,15 @@
  * Parser for Claude Code session files.
  *
  * Supports two formats:
- * 1. JSON array of messages (single JSON blob)
- * 2. NDJSON (one JSON object per line, as Claude Code exports)
+ * 1. JSON array of messages (simple [{role, content}, ...])
+ * 2. NDJSON (one JSON object per line — real Claude Code session format)
  *
- * Normalizes into our canonical Session format.
+ * Real Claude Code NDJSON entries have:
+ * - Top-level `type`: "user" | "assistant" | "system" | "queue-operation" | "attachment" | "ai-title"
+ * - `message.role` + `message.content` for user/assistant entries
+ * - `message.content` is an array of blocks: {type: "text"|"tool_use"|"tool_result"|"thinking", ...}
+ * - `toolUseResult` on user entries that carry tool output
+ * - `cwd`, `sessionId`, `timestamp`, `uuid` at top level
  */
 
 import type { Session, Message, ToolCall, SessionMetadata } from "../types/index.js";
@@ -30,14 +35,30 @@ export function parseClaudeSession(raw: string): Session {
 // --- Raw entry parsing ---
 
 interface RawEntry {
+  // Claude Code NDJSON top-level fields
   type?: string;
+  timestamp?: string;
+  sessionId?: string;
+  uuid?: string;
+  cwd?: string;
+  isSidechain?: boolean;
+  toolUseResult?: Record<string, unknown>;
+  sourceToolAssistantUUID?: string;
+
+  // Simple format fields
   role?: string;
+  content?: unknown;
+
+  // Nested message (Claude Code NDJSON format)
   message?: {
     role?: string;
     content?: unknown;
     model?: string;
+    id?: string;
+    usage?: Record<string, unknown>;
   };
-  content?: unknown;
+
+  // Streaming format
   content_block?: {
     type?: string;
     name?: string;
@@ -45,15 +66,10 @@ interface RawEntry {
     text?: string;
   };
   model?: string;
-  timestamp?: string;
-  // Claude Code NDJSON fields
-  parentMessageId?: string;
-  sessionId?: string;
-  uuid?: string;
-  cwd?: string;
-  toolUseResult?: unknown;
-  isSidechain?: boolean;
 }
+
+const MESSAGE_TYPES = new Set(["user", "assistant", "system"]);
+const SKIP_TYPES = new Set(["queue-operation", "attachment", "ai-title"]);
 
 function parseRawEntries(raw: string): RawEntry[] {
   const trimmed = raw.trim();
@@ -68,7 +84,7 @@ function parseRawEntries(raw: string): RawEntry[] {
     }
   }
 
-  // Try NDJSON
+  // NDJSON
   const lines = trimmed.split("\n").filter((l) => l.trim());
   const entries: RawEntry[] = [];
   for (const line of lines) {
@@ -95,6 +111,9 @@ function extractMessages(entries: RawEntry[]): Message[] {
   let index = 0;
 
   for (const entry of entries) {
+    // Skip non-message entries
+    if (entry.type && SKIP_TYPES.has(entry.type)) continue;
+
     const role = resolveRole(entry);
     if (!role) continue;
 
@@ -117,74 +136,106 @@ function extractMessages(entries: RawEntry[]): Message[] {
 function resolveRole(
   entry: RawEntry
 ): "user" | "assistant" | "system" | "tool" | null {
-  // Direct role field
-  if (entry.role === "user" || entry.role === "assistant" || entry.role === "system") {
-    return entry.role;
+  // Claude Code NDJSON: top-level `type` field is the entry type
+  if (entry.type && MESSAGE_TYPES.has(entry.type)) {
+    // But user entries carrying tool results are "tool" role messages
+    if (entry.type === "user" && hasToolResults(entry)) {
+      return "tool";
+    }
+    return entry.type as "user" | "assistant" | "system";
   }
 
-  // Nested message.role
-  if (entry.message?.role) {
-    const r = entry.message.role;
-    if (r === "user" || r === "assistant" || r === "system") return r;
+  // Simple format: direct `role` field
+  if (entry.role && MESSAGE_TYPES.has(entry.role)) {
+    return entry.role as "user" | "assistant" | "system";
   }
 
-  // Tool results
+  // Nested message.role (fallback)
+  if (entry.message?.role && MESSAGE_TYPES.has(entry.message.role)) {
+    if (entry.message.role === "user" && hasToolResults(entry)) {
+      return "tool";
+    }
+    return entry.message.role as "user" | "assistant" | "system";
+  }
+
+  // Legacy tool result entries
   if (entry.type === "tool_result" || entry.toolUseResult !== undefined) {
     return "tool";
-  }
-
-  // Content blocks from assistant
-  if (entry.type === "content_block_delta" || entry.type === "content_block_start") {
-    return "assistant";
   }
 
   return null;
 }
 
-function resolveContent(entry: RawEntry): string {
-  // Direct string content
-  if (typeof entry.content === "string") return entry.content;
+function hasToolResults(entry: RawEntry): boolean {
+  // Check if this user entry is actually carrying tool_result content blocks
+  const content = entry.message?.content ?? entry.content;
+  if (Array.isArray(content)) {
+    return content.some(
+      (block: Record<string, unknown>) =>
+        typeof block === "object" && block !== null && block.type === "tool_result"
+    );
+  }
+  return entry.toolUseResult !== undefined;
+}
 
-  // Array of content blocks (Claude API format)
-  if (Array.isArray(entry.content)) {
-    return entry.content
-      .map((block: { type?: string; text?: string }) => {
+// --- Content extraction ---
+
+function resolveContent(entry: RawEntry): string {
+  // Prefer message.content (Claude Code NDJSON format)
+  const messageContent = entry.message?.content;
+  if (messageContent !== undefined) {
+    return contentToString(messageContent);
+  }
+
+  // Direct content field (simple format)
+  if (entry.content !== undefined) {
+    return contentToString(entry.content);
+  }
+
+  // toolUseResult on tool response entries
+  if (entry.toolUseResult !== undefined) {
+    const result = entry.toolUseResult;
+    if (typeof result === "string") return result;
+    if (typeof result.stdout === "string") return result.stdout as string;
+    return JSON.stringify(result);
+  }
+
+  // Content block (streaming format)
+  if (entry.content_block?.text) return entry.content_block.text;
+
+  return "";
+}
+
+function contentToString(content: unknown): string {
+  if (typeof content === "string") return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .map((block: Record<string, unknown>) => {
         if (typeof block === "string") return block;
-        if (block.type === "text" && block.text) return block.text;
-        if (block.type === "tool_use") return `[Tool: ${(block as Record<string, unknown>).name}]`;
-        if (block.type === "tool_result") {
-          const result = block as Record<string, unknown>;
-          if (typeof result.content === "string") return result.content;
-          return "[Tool Result]";
+        if (!block || typeof block !== "object") return "";
+
+        switch (block.type) {
+          case "text":
+            return typeof block.text === "string" ? block.text : "";
+          case "thinking":
+            // Include thinking as it shows reasoning
+            return typeof block.thinking === "string"
+              ? `[Thinking] ${(block.thinking as string).slice(0, 300)}`
+              : "";
+          case "tool_use":
+            return `[Tool: ${block.name || "unknown"}]`;
+          case "tool_result": {
+            if (typeof block.content === "string") return block.content;
+            if (block.is_error) return "[Tool Error]";
+            return "[Tool Result]";
+          }
+          default:
+            return "";
         }
-        return "";
       })
       .filter(Boolean)
       .join("\n");
-  }
-
-  // Nested message.content
-  if (entry.message?.content) {
-    if (typeof entry.message.content === "string") return entry.message.content;
-    if (Array.isArray(entry.message.content)) {
-      return (entry.message.content as Array<{ type?: string; text?: string }>)
-        .map((block) => {
-          if (typeof block === "string") return block;
-          if (block.text) return block.text;
-          return "";
-        })
-        .filter(Boolean)
-        .join("\n");
-    }
-  }
-
-  // Content block
-  if (entry.content_block?.text) return entry.content_block.text;
-
-  // Tool use result
-  if (entry.toolUseResult !== undefined) {
-    if (typeof entry.toolUseResult === "string") return entry.toolUseResult;
-    return JSON.stringify(entry.toolUseResult);
   }
 
   return "";
@@ -198,44 +249,43 @@ function resolveToolCallsFromEntry(
 ): ToolCall[] {
   const calls: ToolCall[] = [];
 
-  // Content array with tool_use blocks
+  // Extract tool_use blocks from content arrays
+  const sources: unknown[][] = [];
+
+  if (Array.isArray(entry.message?.content)) {
+    sources.push(entry.message!.content as unknown[]);
+  }
   if (Array.isArray(entry.content)) {
-    let toolIndex = 0;
-    for (const block of entry.content) {
+    sources.push(entry.content as unknown[]);
+  }
+
+  let toolIndex = 0;
+  for (const source of sources) {
+    for (const block of source) {
       const b = block as Record<string, unknown>;
-      if (b.type === "tool_use") {
+      if (b && typeof b === "object" && b.type === "tool_use") {
         calls.push({
           index: toolIndex++,
           messageIndex,
           name: String(b.name || "unknown"),
           input: (b.input as Record<string, unknown>) || {},
+          timestamp: entry.timestamp,
         });
       }
     }
   }
 
-  // Nested message.content with tool_use
-  if (Array.isArray(entry.message?.content)) {
-    let toolIndex = 0;
-    for (const block of entry.message!.content as Array<Record<string, unknown>>) {
-      if (block.type === "tool_use") {
-        calls.push({
-          index: toolIndex++,
-          messageIndex,
-          name: String(block.name || "unknown"),
-          input: (block.input as Record<string, unknown>) || {},
-        });
-      }
-    }
-  }
-
-  // Content block type tool_use
-  if (entry.content_block?.type === "tool_use" && entry.content_block.name) {
+  // Streaming content_block
+  if (
+    entry.content_block?.type === "tool_use" &&
+    entry.content_block.name
+  ) {
     calls.push({
       index: 0,
       messageIndex,
       name: entry.content_block.name,
       input: (entry.content_block.input as Record<string, unknown>) || {},
+      timestamp: entry.timestamp,
     });
   }
 
@@ -264,8 +314,9 @@ function buildMetadata(
   toolCalls: ToolCall[],
   entries: RawEntry[]
 ): SessionMetadata {
-  const model = entries.find((e) => e.message?.model)?.message?.model
-    || entries.find((e) => e.model)?.model;
+  const model =
+    entries.find((e) => e.message?.model)?.message?.model ||
+    entries.find((e) => e.model)?.model;
 
   const cwd = entries.find((e) => e.cwd)?.cwd;
 
