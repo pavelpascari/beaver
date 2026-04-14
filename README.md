@@ -61,13 +61,29 @@ Options:
 | Spec friction | Requirements were unclear or incomplete |
 | Retrieval friction | Agent couldn't efficiently find information through search |
 
-## Example
+## Examples
+
+The `examples/` folder contains sample sessions and their generated reports:
+
+| File | Description |
+|------|-------------|
+| `examples/example-session.json` | Synthetic session: agent fixing a login form validation bug |
+| `examples/example-report.md` | Generated report for the above |
+| `examples/beaver-build-session.jsonl` | Real Claude Code session: building Beaver itself |
+| `examples/beaver-build-report.md` | Generated report for the above |
 
 ```bash
-beaver analyze example-session.json
+# Analyze the synthetic example
+beaver analyze examples/example-session.json
+
+# Analyze the real session (Beaver building itself)
+beaver analyze examples/beaver-build-session.jsonl
+
+# Output as markdown
+beaver analyze examples/example-session.json -f markdown -o report.md
 ```
 
-The included `example-session.json` is a realistic session where an agent fixes a login form validation bug. The agent:
+The synthetic example session shows an agent that:
 - Explores 7+ files to find the validation logic
 - Fixes an email regex and adds change-event validation
 - Hits test failures due to incomplete first pass (forgot password field, forgot test mock)
