@@ -2,13 +2,22 @@
  * Finalizer.
  *
  * Aggregates chunk analyses into a complete report.
- * This is the most important step — it synthesizes everything
- * into a coherent, actionable output.
+ * Integrates the friction score, expected-vs-observed, and
+ * (optionally) LLM-produced insight.
  */
 
 import type { Session } from "../types/session.js";
-import type { SessionEvent, FileWriteEvent, FileReadEvent, SearchEvent } from "../types/events.js";
-import type { ChunkAnalysis, FrictionCategory, PhaseType } from "../types/chunks.js";
+import type {
+  SessionEvent,
+  FileWriteEvent,
+  FileReadEvent,
+  SearchEvent,
+} from "../types/events.js";
+import type {
+  ChunkAnalysis,
+  FrictionCategory,
+  PhaseType,
+} from "../types/chunks.js";
 import type {
   Report,
   EffortBreakdown,
@@ -19,27 +28,89 @@ import type {
   Recommendation,
   GitContext,
 } from "../types/report.js";
+import type { FrictionScore } from "../types/scoring.js";
+import type { ExpectedVsObserved } from "../types/expectations.js";
+import type { LLMInsight } from "../analysis/llm-insight.js";
+import { computeFrictionScore } from "../analysis/scoring.js";
+import { computeExpectedVsObserved } from "../analysis/expectations.js";
+
+export interface FinalizeOptions {
+  llmInsight?: LLMInsight;
+  llmFallbackReason?: string;
+  llmRequested?: boolean;
+}
 
 export function finalize(
   session: Session,
   chunkAnalyses: ChunkAnalysis[],
   events: SessionEvent[],
-  gitContext: GitContext
+  gitContext: GitContext,
+  options: FinalizeOptions = {}
 ): Report {
+  const keySignals = buildKeySignals(events);
+  const effortBreakdown = buildEffortBreakdown(chunkAnalyses);
+  const frictionScore = computeFrictionScore({
+    chunkAnalyses,
+    events,
+    keySignals,
+  });
+  const expectedVsObserved = computeExpectedVsObserved({
+    session,
+    keySignals,
+    chunkAnalyses,
+    complexityOverride: options.llmInsight?.taskComplexity,
+  });
+
+  // Merge LLM insight into expected vs observed narratives if present.
+  const mergedExpectations = mergeExpectations(expectedVsObserved, options.llmInsight);
+
+  // Weave phase insights into chunk analyses.
+  const enrichedChunks = options.llmInsight
+    ? applyPhaseInsights(chunkAnalyses, options.llmInsight)
+    : chunkAnalyses;
+
+  const heuristicFriction = buildFrictionAnalysis(enrichedChunks);
+  const frictionAnalysis = options.llmInsight?.primaryFriction
+    ? overridePrimaryFriction(heuristicFriction, options.llmInsight.primaryFriction)
+    : heuristicFriction;
+
+  const heuristicRecommendations = buildRecommendations(enrichedChunks, events);
+  const recommendations = options.llmInsight?.recommendations?.length
+    ? dedupeRecommendations([
+        ...options.llmInsight.recommendations,
+        ...heuristicRecommendations,
+      ])
+    : heuristicRecommendations;
+
+  const taskSummary =
+    options.llmInsight?.taskSummary ?? buildTaskSummary(session, enrichedChunks);
+  const headline = options.llmInsight?.headline ?? frictionScore.headline;
+
+  const analysisMode: Report["metadata"]["analysisMode"] = options.llmInsight
+    ? "hybrid"
+    : "heuristic";
+
   return {
-    taskSummary: buildTaskSummary(session, chunkAnalyses),
-    effortBreakdown: buildEffortBreakdown(chunkAnalyses),
-    keySignals: buildKeySignals(events),
-    frictionAnalysis: buildFrictionAnalysis(chunkAnalyses, events),
-    evidence: buildEvidence(chunkAnalyses),
-    recommendations: buildRecommendations(chunkAnalyses, events),
-    chunks: chunkAnalyses,
+    taskSummary,
+    headline,
+    effortBreakdown,
+    keySignals,
+    frictionScore,
+    expectedVsObserved: mergedExpectations,
+    frictionAnalysis,
+    evidence: buildEvidence(enrichedChunks),
+    recommendations,
+    chunks: enrichedChunks,
     gitContext,
     metadata: {
       generatedAt: new Date().toISOString(),
-      beaverVersion: "0.1.0",
+      beaverVersion: "0.2.0",
       sessionProvider: session.provider,
-      analysisMode: "heuristic",
+      analysisMode,
+      llmModel: options.llmInsight?.model,
+      llmTokensUsed: options.llmInsight?.tokensUsed,
+      llmFallback: options.llmRequested === true && !options.llmInsight,
+      llmFallbackReason: options.llmFallbackReason,
     },
   };
 }
@@ -56,11 +127,8 @@ function buildTaskSummary(
     ? formatDuration(session.metadata.durationMs)
     : "unknown duration";
 
-  // Try to extract task description from first user message
   const firstUserMsg = session.messages.find((m) => m.role === "user");
-  const taskHint = firstUserMsg
-    ? truncate(firstUserMsg.content, 120)
-    : "Unknown task";
+  const taskHint = firstUserMsg ? truncate(firstUserMsg.content, 120) : "Unknown task";
 
   return [
     `Task: ${taskHint}`,
@@ -87,7 +155,6 @@ function buildEffortBreakdown(chunks: ChunkAnalysis[]): EffortBreakdown {
     totals[chunk.phase] += chunk.eventCount;
   }
 
-  // Normalize to percentages
   if (totalEvents === 0) {
     return { exploration: 25, implementation: 25, debugging: 25, verification: 25 };
   }
@@ -155,28 +222,20 @@ function buildKeySignals(events: SessionEvent[]): KeySignals {
 
 // --- Friction analysis ---
 
-function buildFrictionAnalysis(
-  chunks: ChunkAnalysis[],
-  events: SessionEvent[]
-): FrictionAnalysis {
-  // Count friction categories across all chunks
+function buildFrictionAnalysis(chunks: ChunkAnalysis[]): FrictionAnalysis {
   const frictionCounts = new Map<FrictionCategory, number>();
   const frictionEvidence = new Map<FrictionCategory, string[]>();
 
   for (const chunk of chunks) {
     for (const friction of chunk.frictionClassification) {
       frictionCounts.set(friction, (frictionCounts.get(friction) || 0) + 1);
-
-      if (!frictionEvidence.has(friction)) {
-        frictionEvidence.set(friction, []);
-      }
-      frictionEvidence.get(friction)!.push(
-        `Detected in ${chunk.phase} phase: ${chunk.summary}`
-      );
+      if (!frictionEvidence.has(friction)) frictionEvidence.set(friction, []);
+      frictionEvidence
+        .get(friction)!
+        .push(`Detected in ${chunk.phase} phase: ${chunk.summary}`);
     }
   }
 
-  // Add pattern-based friction evidence
   for (const chunk of chunks) {
     for (const pattern of chunk.patterns) {
       for (const friction of chunk.frictionClassification) {
@@ -185,12 +244,9 @@ function buildFrictionAnalysis(
     }
   }
 
-  // Sort by frequency
-  const sorted = Array.from(frictionCounts.entries())
-    .sort((a, b) => b[1] - a[1]);
+  const sorted = Array.from(frictionCounts.entries()).sort((a, b) => b[1] - a[1]);
 
   if (sorted.length === 0) {
-    // No friction detected - this is good!
     return {
       primary: {
         category: "discovery_friction",
@@ -215,7 +271,10 @@ function buildFrictionAnalysis(
     secondary: secondary.map(([cat, count]) => ({
       category: cat,
       description: describeFriction(cat),
-      severity: (count > 2 ? "high" : count > 1 ? "medium" : "low") as "high" | "medium" | "low",
+      severity: (count > 2 ? "high" : count > 1 ? "medium" : "low") as
+        | "high"
+        | "medium"
+        | "low",
       evidence: frictionEvidence.get(cat) || [],
     })),
   };
@@ -241,13 +300,45 @@ function describeFriction(category: FrictionCategory): string {
   return descriptions[category];
 }
 
+function overridePrimaryFriction(
+  base: FrictionAnalysis,
+  primary: NonNullable<LLMInsight["primaryFriction"]>
+): FrictionAnalysis {
+  // If LLM's primary matches current primary, keep existing secondaries.
+  // Otherwise, demote current primary into secondaries.
+  if (base.primary.category === primary.category) {
+    return {
+      primary: {
+        category: primary.category,
+        description: primary.description,
+        severity: primary.severity,
+        evidence:
+          primary.evidence.length > 0 ? primary.evidence : base.primary.evidence,
+      },
+      secondary: base.secondary,
+    };
+  }
+  const newSecondary: FrictionItem[] = [
+    base.primary,
+    ...base.secondary.filter((s) => s.category !== primary.category),
+  ];
+  return {
+    primary: {
+      category: primary.category,
+      description: primary.description,
+      severity: primary.severity,
+      evidence: primary.evidence,
+    },
+    secondary: newSecondary,
+  };
+}
+
 // --- Evidence ---
 
 function buildEvidence(chunks: ChunkAnalysis[]): Evidence[] {
   const evidence: Evidence[] = [];
 
   for (const chunk of chunks) {
-    // High effort signals are evidence
     for (const signal of chunk.effortSignals) {
       if (signal.weight === "high" || signal.weight === "medium") {
         evidence.push({
@@ -258,7 +349,6 @@ function buildEvidence(chunks: ChunkAnalysis[]): Evidence[] {
       }
     }
 
-    // Patterns are evidence
     for (const pattern of chunk.patterns) {
       evidence.push({
         claim: pattern,
@@ -281,12 +371,9 @@ function buildRecommendations(
   const frictions = new Set<FrictionCategory>();
 
   for (const chunk of chunks) {
-    for (const f of chunk.frictionClassification) {
-      frictions.add(f);
-    }
+    for (const f of chunk.frictionClassification) frictions.add(f);
   }
 
-  // Discovery friction recommendations
   if (frictions.has("discovery_friction")) {
     const readFiles = events
       .filter((e) => e.type === "file_read")
@@ -299,6 +386,9 @@ function buildRecommendations(
       impact: "high",
       effort: "low",
       category: "discovery_friction",
+      targets: topFiles(readFiles, 5),
+      successMetric: "exploration share drops below 25% in next session",
+      source: "heuristic",
     });
   }
 
@@ -314,6 +404,9 @@ function buildRecommendations(
       impact: "medium",
       effort: "medium",
       category: "retrieval_friction",
+      targets: searches.slice(0, 5),
+      successMetric: "searches reduced by ~50% for similar tasks",
+      source: "heuristic",
     });
   }
 
@@ -325,6 +418,8 @@ function buildRecommendations(
       impact: "medium",
       effort: "medium",
       category: "verification_friction",
+      successMetric: "first test run passes on next session",
+      source: "heuristic",
     });
   }
 
@@ -336,6 +431,8 @@ function buildRecommendations(
       impact: "high",
       effort: "low",
       category: "interpretation_friction",
+      successMetric: "zero plan revisions in next session",
+      source: "heuristic",
     });
   }
 
@@ -347,6 +444,8 @@ function buildRecommendations(
       impact: "high",
       effort: "medium",
       category: "tooling_friction",
+      successMetric: "zero retries in next session",
+      source: "heuristic",
     });
   }
 
@@ -362,10 +461,11 @@ function buildRecommendations(
       impact: "medium",
       effort: "high",
       category: "boundary_friction",
+      targets: topFiles(writeFiles, 5),
+      source: "heuristic",
     });
   }
 
-  // Always add a contextual recommendation based on session patterns
   const retryCount = events.filter((e) => e.type === "retry").length;
   if (retryCount > 0 && !frictions.has("tooling_friction")) {
     recommendations.push({
@@ -374,13 +474,70 @@ function buildRecommendations(
       impact: "medium",
       effort: "low",
       category: "tooling_friction",
+      source: "heuristic",
     });
   }
 
   return recommendations;
 }
 
-// --- Helpers ---
+// --- Merging helpers ---
+
+function mergeExpectations(
+  base: ExpectedVsObserved,
+  insight: LLMInsight | undefined
+): ExpectedVsObserved {
+  if (!insight) return base;
+  return {
+    ...base,
+    expectedNarrative: insight.expectedNarrative ?? base.expectedNarrative,
+    observedNarrative: insight.observedNarrative ?? base.observedNarrative,
+    biggestDivergence: insight.biggestDivergence ?? base.biggestDivergence,
+    taskComplexity: insight.taskComplexity ?? base.taskComplexity,
+  };
+}
+
+function applyPhaseInsights(
+  chunks: ChunkAnalysis[],
+  insight: LLMInsight
+): ChunkAnalysis[] {
+  if (!insight.insightByPhase || insight.insightByPhase.length === 0) {
+    return chunks;
+  }
+  const byPhase = new Map<PhaseType, string>();
+  for (const p of insight.insightByPhase) {
+    if (!byPhase.has(p.phase)) byPhase.set(p.phase, p.insight);
+  }
+  return chunks.map((c) => ({
+    ...c,
+    insight: byPhase.get(c.phase) ?? c.insight,
+    source: byPhase.has(c.phase) ? ("hybrid" as const) : c.source,
+  }));
+}
+
+function dedupeRecommendations(recs: Recommendation[]): Recommendation[] {
+  const seen = new Set<string>();
+  const out: Recommendation[] = [];
+  for (const r of recs) {
+    // De-dupe by normalized title per category.
+    const key = `${r.category}:${r.title.toLowerCase().replace(/\s+/g, " ").trim()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+  }
+  return out;
+}
+
+// --- Small utils ---
+
+function topFiles(paths: string[], n: number): string[] {
+  const counts = new Map<string, number>();
+  for (const p of paths) counts.set(p, (counts.get(p) ?? 0) + 1);
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([p]) => p);
+}
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
@@ -391,7 +548,6 @@ function formatDuration(ms: number): string {
 }
 
 function truncate(str: string, maxLen: number): string {
-  // Take first line, truncate if needed
   const firstLine = str.split("\n")[0].trim();
   if (firstLine.length <= maxLen) return firstLine;
   return firstLine.slice(0, maxLen - 3) + "...";
