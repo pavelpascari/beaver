@@ -1,6 +1,6 @@
 {
   "name": "beaver-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Analyze coding agent sessions, detect friction, suggest improvements that compound over time.",
   "type": "module",
   "main": "dist/index.js",

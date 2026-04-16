@@ -23,6 +23,10 @@ export interface ChunkAnalysis {
   frictionClassification: FrictionCategory[];
   patterns: string[];
   eventCount: number;
+  /** LLM-generated narrative insight about this phase, if available. */
+  insight?: string;
+  /** Source of this chunk analysis. */
+  source?: "heuristic" | "llm" | "hybrid";
 }
 
 export interface EffortSignal {

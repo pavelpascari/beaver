@@ -11,6 +11,10 @@ import { finalize } from "../finalizer/finalizer.js";
 import { detectGitContext } from "../analysis/git.js";
 import { renderCli } from "../render/cli.js";
 import { renderMarkdown } from "../render/markdown.js";
+import { computeFrictionScore } from "../analysis/scoring.js";
+import { computeExpectedVsObserved } from "../analysis/expectations.js";
+import { createLLMClient, LLMConfigError } from "../analysis/llm-client.js";
+import { runLLMInsight } from "../analysis/llm-insight.js";
 
 const program = new Command();
 
@@ -19,7 +23,7 @@ program
   .description(
     "Analyze coding agent sessions, detect friction, suggest improvements."
   )
-  .version("0.1.0");
+  .version("0.2.0");
 
 program
   .command("analyze")
@@ -31,32 +35,100 @@ program
     "--provider <provider>",
     "Session provider: claude (auto-detected if omitted)"
   )
+  .option(
+    "--llm",
+    "Enable LLM-powered insight layer (requires ANTHROPIC_API_KEY)"
+  )
+  .option("--model <id>", "Override LLM model (default: claude-sonnet-4-6)")
+  .option(
+    "--api-key <key>",
+    "Anthropic API key (defaults to ANTHROPIC_API_KEY env var)"
+  )
+  .option(
+    "--llm-timeout <ms>",
+    "LLM request timeout in milliseconds",
+    (v) => parseInt(v, 10),
+    60_000
+  )
   .action(async (sessionFile: string, options: AnalyzeOptions) => {
     try {
       const filePath = resolve(sessionFile);
       const raw = await readFile(filePath, "utf-8");
 
-      // Parse session
       const session = parseClaudeSession(raw);
-
-      // Extract events
       const events = extractEvents(session);
-
-      // Chunk into phases
       const chunks = chunkSession(session, events);
-
-      // Analyze each chunk (heuristic mode for MVP)
       const chunkAnalyses = chunks.map((chunk) => analyzeHeuristic(chunk));
-
-      // Detect git context
       const gitContext = await detectGitContext(
         session.metadata.workingDirectory
       );
 
-      // Finalize into report
-      const report = finalize(session, chunkAnalyses, events, gitContext);
+      let llmInsight;
+      let llmFallbackReason: string | undefined;
 
-      // Render
+      if (options.llm) {
+        try {
+          const client = createLLMClient({
+            apiKey: options.apiKey,
+            model: options.model,
+            timeoutMs: options.llmTimeout,
+          });
+
+          // Feed the LLM the deterministic signals it needs to reason.
+          const keySignalsForLLM = deriveKeySignals(events);
+          const score = computeFrictionScore({
+            chunkAnalyses,
+            events,
+            keySignals: keySignalsForLLM,
+          });
+          const expectedVsObserved = computeExpectedVsObserved({
+            session,
+            keySignals: keySignalsForLLM,
+            chunkAnalyses,
+          });
+
+          process.stderr.write(
+            `[beaver] calling ${client.model} for insight layer...\n`
+          );
+          const result = await runLLMInsight(client, {
+            session,
+            events,
+            chunkAnalyses,
+            keySignals: keySignalsForLLM,
+            gitContext,
+            frictionScore: score,
+            expectedVsObserved,
+          });
+
+          if (result.ok) {
+            llmInsight = result.insight;
+            process.stderr.write(
+              `[beaver] insight layer ok (${result.insight.tokensUsed} tokens)\n`
+            );
+          } else {
+            llmFallbackReason = result.reason;
+            process.stderr.write(
+              `[beaver] LLM insight failed, falling back to heuristic: ${result.reason}\n`
+            );
+          }
+        } catch (err) {
+          if (err instanceof LLMConfigError) {
+            llmFallbackReason = err.message;
+            process.stderr.write(
+              `[beaver] LLM disabled: ${err.message}. Falling back to heuristic.\n`
+            );
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      const report = finalize(session, chunkAnalyses, events, gitContext, {
+        llmInsight,
+        llmFallbackReason,
+        llmRequested: Boolean(options.llm),
+      });
+
       const output =
         options.format === "markdown"
           ? renderMarkdown(report)
@@ -76,10 +148,63 @@ program
     }
   });
 
+// Minimal local copy to avoid circular import with finalizer — finalizer
+// will recompute internally, we only use this for the LLM prompt inputs.
+function deriveKeySignals(events: import("../types/events.js").SessionEvent[]) {
+  const files = new Set<string>();
+  let filesRead = 0,
+    filesWritten = 0,
+    searches = 0,
+    retries = 0,
+    testRuns = 0,
+    commands = 0,
+    edits = 0;
+  for (const e of events) {
+    const d = e.data as { path?: string };
+    switch (e.type) {
+      case "file_read":
+        filesRead++;
+        if (d.path) files.add(d.path);
+        break;
+      case "file_write":
+        filesWritten++;
+        edits++;
+        if (d.path) files.add(d.path);
+        break;
+      case "search":
+        searches++;
+        break;
+      case "test_run":
+        testRuns++;
+        break;
+      case "command_run":
+        commands++;
+        break;
+      case "retry":
+        retries++;
+        break;
+    }
+  }
+  return {
+    filesRead,
+    filesWritten,
+    searches,
+    edits,
+    retries,
+    testRuns,
+    commands,
+    uniqueFilesTouched: Array.from(files),
+  };
+}
+
 interface AnalyzeOptions {
   format: "cli" | "markdown";
   output?: string;
   provider?: string;
+  llm?: boolean;
+  model?: string;
+  apiKey?: string;
+  llmTimeout: number;
 }
 
 program.parse();

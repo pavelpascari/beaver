@@ -8,8 +8,10 @@ After a coding agent (Claude, Codex, etc.) completes a task, Beaver analyzes the
 
 - **What happened?** — Task summary and event breakdown
 - **Where was effort spent?** — Exploration vs. implementation vs. debugging vs. verification
+- **How painful was it?** — A 0–100 friction score with letter grade and per-category breakdown
+- **What was expected vs what actually happened?** — A baseline of how a well-run session should look, contrasted against the observed session
 - **What was harder than it should have been?** — Friction detection with evidence
-- **What should change?** — Actionable recommendations for next time
+- **What should change?** — Actionable recommendations with file targets, success metrics, and (optionally) LLM-authored specificity
 
 Beaver is a **reflection tool**, not a runtime. Small improvements discovered from each session compound into a system that becomes easier and faster for agents to operate in.
 
@@ -35,19 +37,37 @@ beaver analyze session.json -f markdown -o report.md
 beaver analyze <session_file> [options]
 
 Options:
-  -f, --format <format>  Output format: cli or markdown (default: "cli")
-  -o, --output <path>    Write report to file instead of stdout
-  --provider <provider>  Session provider (auto-detected if omitted)
+  -f, --format <format>   Output format: cli or markdown (default: "cli")
+  -o, --output <path>     Write report to file instead of stdout
+  --provider <provider>   Session provider (auto-detected if omitted)
+  --llm                   Enable LLM-powered insight layer (requires ANTHROPIC_API_KEY)
+  --model <id>            Override LLM model (default: claude-sonnet-4-6)
+  --api-key <key>         Anthropic API key (defaults to ANTHROPIC_API_KEY env var)
+  --llm-timeout <ms>      LLM request timeout in ms (default: 60000)
+```
+
+### Heuristic vs LLM mode
+
+Beaver runs in **heuristic mode by default** — no network calls, instant analysis. Pass `--llm` to add a single, high-leverage LLM call that refines the narrative, classifies task complexity, and produces specific recommendations with targets and success metrics. The heuristic score and expected-vs-observed baseline still run first; the LLM only adds judgment on top.
+
+If the LLM call fails (missing key, network, invalid response), Beaver falls back cleanly to heuristic output and records the reason in the report metadata.
+
+```bash
+export ANTHROPIC_API_KEY=sk-...
+beaver analyze session.json --llm
 ```
 
 ## What a Report Contains
 
-1. **Task summary** — What the agent was asked to do
-2. **Effort breakdown** — % split across exploration, implementation, debugging, verification
-3. **Key signals** — Files read/written, searches, retries, test runs
-4. **Friction analysis** — Primary and secondary friction with severity
-5. **Evidence** — Specific observations backing each claim
-6. **Recommendations** — Actionable improvements ranked by impact and effort
+1. **Headline / TL;DR** — One-line executive summary of how the session went
+2. **Friction score** — 0–100 numeric score with letter grade (A–F), per-category breakdown, and ranked contributors
+3. **Task summary** — What the agent was asked to do
+4. **Expected vs observed** — Baseline expectations for a task of this complexity vs what actually happened, with a per-metric delta table and the "biggest divergence"
+5. **Effort breakdown** — % split across exploration, implementation, debugging, verification
+6. **Key signals** — Files read/written, searches, retries, test runs
+7. **Friction analysis** — Primary and secondary friction with severity
+8. **Evidence** — Specific observations backing each claim
+9. **Recommendations** — Actionable improvements ranked by impact/effort, with concrete targets, success metrics, and optional drop-in snippets
 
 ### Friction Categories
 
@@ -100,10 +120,10 @@ src/
   parser/       Session file parsers (Claude Code format)
   events/       Event extraction from parsed sessions
   chunking/     Phase detection (exploration/implementation/debugging/verification)
-  analysis/     Heuristic analysis + LLM prompt templates
-  finalizer/    Aggregation into final report
+  analysis/     Heuristic analysis, scoring, expected-vs-observed, LLM client + prompts
+  finalizer/    Aggregation into final report (merges heuristic + LLM layers)
   render/       Output renderers (CLI pretty-print + Markdown)
-  types/        Shared type definitions
+  types/        Shared type definitions (session, events, chunks, scoring, expectations, report)
 ```
 
 ### Data Flow
@@ -125,8 +145,9 @@ session file → parser → canonical Session
 ### Design Decisions
 
 - **TypeScript** — Type safety for the analysis pipeline, fast iteration, good CLI ecosystem
-- **Minimal dependencies** — Only `commander` for CLI parsing. No LLM SDK (yet), no heavy frameworks
-- **Heuristic-first** — MVP uses pattern matching and heuristics. LLM prompt templates are included and ready for integration
+- **Minimal dependencies** — Only `commander` for CLI parsing. LLM calls use native `fetch` against Anthropic's Messages API — no SDK dependency
+- **Heuristic-first, LLM-on-top** — The scoring model and expected-vs-observed baseline are deterministic and always run. The LLM layer is a single high-leverage call that adds narrative and specificity on top of the heuristic signals it was given
+- **Graceful fallback** — If the LLM call fails for any reason, Beaver silently degrades to heuristic output and records the fallback reason in the report metadata
 - **Extensible parser** — Parser layer normalizes into a canonical `Session` type. Adding new providers (Codex, Cursor, etc.) means adding a new parser function
 - **Clean module boundaries** — Each module has a single responsibility and communicates through typed interfaces
 
@@ -150,11 +171,12 @@ npm run beaver       # Run CLI
 
 ## Future Directions
 
-- LLM-powered chunk and finalizer analysis (prompts are ready)
+- Per-chunk LLM deep-dive mode (prompts are ready — currently we prefer one high-leverage call per session for cost)
 - Additional session providers (Codex, Cursor, Aider)
 - Multi-session aggregation (track friction trends over time)
-- CLAUDE.md generation from analysis patterns
+- CLAUDE.md auto-generation from analysis patterns
 - Git diff integration for richer context
+- Task-type-aware baselines (bugfix vs feature vs refactor have different healthy profiles)
 
 ## License
 
