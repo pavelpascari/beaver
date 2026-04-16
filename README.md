@@ -57,6 +57,18 @@ export ANTHROPIC_API_KEY=sk-...
 beaver analyze session.json --llm
 ```
 
+### Authentication
+
+`--llm` supports two auth modes, resolved in this order:
+
+1. `--api-key <key>` flag (explicit override)
+2. `ANTHROPIC_API_KEY` env var → sent as `x-api-key`
+3. `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` env var → sent as `Authorization: Bearer` with `anthropic-beta: oauth-2025-04-20`
+
+Force a specific mode with `--auth api_key` or `--auth oauth`. The base URL is taken from `ANTHROPIC_BASE_URL` if set.
+
+The OAuth path is useful for real Anthropic OAuth flows. Note: when running inside Claude Code itself, the harness-provided OAuth token is scoped to Claude Code's session endpoint and will return `401 Invalid bearer token` against `/v1/messages` — use an `ANTHROPIC_API_KEY` in that environment.
+
 ## What a Report Contains
 
 1. **Headline / TL;DR** — One-line executive summary of how the session went

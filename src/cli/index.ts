@@ -37,12 +37,17 @@ program
   )
   .option(
     "--llm",
-    "Enable LLM-powered insight layer (requires ANTHROPIC_API_KEY)"
+    "Enable LLM-powered insight layer (uses ANTHROPIC_API_KEY or Claude Code OAuth)"
   )
   .option("--model <id>", "Override LLM model (default: claude-sonnet-4-6)")
   .option(
     "--api-key <key>",
     "Anthropic API key (defaults to ANTHROPIC_API_KEY env var)"
+  )
+  .option(
+    "--auth <mode>",
+    "Auth mode: auto | api_key | oauth (default: auto)",
+    "auto"
   )
   .option(
     "--llm-timeout <ms>",
@@ -70,9 +75,13 @@ program
         try {
           const client = createLLMClient({
             apiKey: options.apiKey,
+            authMode: options.auth,
             model: options.model,
             timeoutMs: options.llmTimeout,
           });
+          process.stderr.write(
+            `[beaver] auth=${client.authMode} base=${client.baseUrl}\n`
+          );
 
           // Feed the LLM the deterministic signals it needs to reason.
           const keySignalsForLLM = deriveKeySignals(events);
@@ -204,6 +213,7 @@ interface AnalyzeOptions {
   llm?: boolean;
   model?: string;
   apiKey?: string;
+  auth: "auto" | "api_key" | "oauth";
   llmTimeout: number;
 }
 
