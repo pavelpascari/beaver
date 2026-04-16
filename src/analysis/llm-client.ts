@@ -21,8 +21,9 @@
  */
 
 import { readSync, fstatSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
-export type AuthMode = "api_key" | "oauth" | "auto";
+export type AuthMode = "api_key" | "oauth" | "claude_cli" | "auto";
 
 export interface LLMClientOptions {
   /** Anthropic API key. Defaults to env ANTHROPIC_API_KEY. */
@@ -51,15 +52,24 @@ export interface LLMClient {
   call(prompt: string, options?: { maxTokens?: number }): Promise<LLMResponse>;
   model: string;
   authMode: Exclude<AuthMode, "auto">;
+  /** Identifier for where calls are sent. URL for HTTP, "claude-cli://..." for spawn. */
   baseUrl: string;
 }
 
 export interface AuthResolution {
   mode: Exclude<AuthMode, "auto">;
-  /** Credential value (secret — never log this). */
+  /** Credential value (secret — never log this). May be empty for claude_cli. */
   credential: string;
   /** Human-readable description of where the credential came from. */
   source: string;
+}
+
+/**
+ * Override hooks for tests. In production these resolve to real syscalls.
+ */
+export interface AuthDeps {
+  /** Returns true if a `claude` binary is on PATH (or wherever `which` looks). */
+  hasClaudeCli?: () => boolean;
 }
 
 const DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -71,12 +81,21 @@ const OAUTH_ANTHROPIC_BETA = "oauth-2025-04-20";
 /**
  * Resolve the effective auth credential + mode based on options and env.
  * Exported for testing — safe to call without network.
+ *
+ * Resolution order (auto mode):
+ *   1. explicit --api-key
+ *   2. ANTHROPIC_API_KEY env
+ *   3. `claude` CLI on PATH (delegates calls to the local binary; covers
+ *      Claude Code harness OAuth without needing a separate API key)
+ *   4. OAuth FD (real Anthropic OAuth flows)
  */
 export function resolveAuth(
   options: LLMClientOptions = {},
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  deps: AuthDeps = {}
 ): AuthResolution {
   const preferred: AuthMode = options.authMode ?? "auto";
+  const hasClaudeCli = deps.hasClaudeCli ?? defaultHasClaudeCli;
 
   // 1. Explicit apiKey option wins unconditionally.
   if (options.apiKey) {
@@ -87,7 +106,6 @@ export function resolveAuth(
     };
   }
 
-  // 2. If user explicitly asked for oauth, only try oauth.
   if (preferred === "oauth") {
     const oauth = readOAuthToken(env);
     if (oauth) return oauth;
@@ -96,7 +114,6 @@ export function resolveAuth(
     );
   }
 
-  // 3. If user explicitly asked for api_key, only try env key.
   if (preferred === "api_key") {
     if (env.ANTHROPIC_API_KEY) {
       return {
@@ -110,7 +127,20 @@ export function resolveAuth(
     );
   }
 
-  // 4. Auto mode: env key first, then OAuth FD.
+  if (preferred === "claude_cli") {
+    if (hasClaudeCli()) {
+      return {
+        mode: "claude_cli",
+        credential: "",
+        source: "delegating to local `claude` binary",
+      };
+    }
+    throw new LLMConfigError(
+      "claude_cli auth requested but `claude` binary not found on PATH."
+    );
+  }
+
+  // Auto mode.
   if (env.ANTHROPIC_API_KEY) {
     return {
       mode: "api_key",
@@ -119,12 +149,32 @@ export function resolveAuth(
     };
   }
 
+  if (hasClaudeCli()) {
+    return {
+      mode: "claude_cli",
+      credential: "",
+      source: "delegating to local `claude` binary",
+    };
+  }
+
   const oauth = readOAuthToken(env);
   if (oauth) return oauth;
 
   throw new LLMConfigError(
-    "No credential available. Set ANTHROPIC_API_KEY, pass --api-key, or run inside a Claude Code session with CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR."
+    "No credential available. Set ANTHROPIC_API_KEY, install the `claude` CLI, or run inside a Claude Code session with CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR."
   );
+}
+
+function defaultHasClaudeCli(): boolean {
+  try {
+    execFileSync("claude", ["--version"], {
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 3000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -168,8 +218,17 @@ function readOAuthToken(env: NodeJS.ProcessEnv): AuthResolution | null {
   }
 }
 
+/**
+ * Direct HTTP client. For most use cases prefer `createClient` (which routes
+ * to the claude CLI delegating transport when claude_cli mode is resolved).
+ */
 export function createLLMClient(options: LLMClientOptions = {}): LLMClient {
   const auth = resolveAuth(options);
+  if (auth.mode === "claude_cli") {
+    throw new LLMConfigError(
+      "createLLMClient does not support claude_cli mode; use createClient instead."
+    );
+  }
   const model = options.model ?? DEFAULT_MODEL;
   const baseUrl =
     options.baseUrl ??
@@ -206,6 +265,25 @@ export function createLLMClient(options: LLMClientOptions = {}): LLMClient {
       throw lastErr;
     },
   };
+}
+
+/**
+ * Unified factory: resolves auth, then constructs either the HTTP client or
+ * the claude-CLI delegating transport. This is what callers should use.
+ */
+export async function createClient(
+  options: LLMClientOptions = {}
+): Promise<LLMClient> {
+  const auth = resolveAuth(options);
+  if (auth.mode === "claude_cli") {
+    // Lazy import to avoid pulling spawn machinery into HTTP-only paths.
+    const { createClaudeCliClient } = await import("./claude-cli-client.js");
+    return createClaudeCliClient({
+      model: options.model,
+      timeoutMs: options.timeoutMs,
+    });
+  }
+  return createLLMClient(options);
 }
 
 async function performCall(

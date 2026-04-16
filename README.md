@@ -59,15 +59,16 @@ beaver analyze session.json --llm
 
 ### Authentication
 
-`--llm` supports two auth modes, resolved in this order:
+`--llm` supports three auth modes, resolved in this order:
 
-1. `--api-key <key>` flag (explicit override)
+1. `--api-key <key>` flag (explicit override) → sent as `x-api-key`
 2. `ANTHROPIC_API_KEY` env var → sent as `x-api-key`
-3. `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` env var → sent as `Authorization: Bearer` with `anthropic-beta: oauth-2025-04-20`
+3. **`claude` CLI on PATH** → spawns `claude -p` and delegates the call to your local Claude Code installation. No credential is handled by Beaver; Claude uses whatever auth you've already set up.
+4. `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` env var → sent as `Authorization: Bearer` with `anthropic-beta: oauth-2025-04-20` (real Anthropic OAuth flows)
 
-Force a specific mode with `--auth api_key` or `--auth oauth`. The base URL is taken from `ANTHROPIC_BASE_URL` if set.
+Force a specific mode with `--auth {api_key,oauth,claude_cli}`. The base URL for the HTTP modes is taken from `ANTHROPIC_BASE_URL` if set.
 
-The OAuth path is useful for real Anthropic OAuth flows. Note: when running inside Claude Code itself, the harness-provided OAuth token is scoped to Claude Code's session endpoint and will return `401 Invalid bearer token` against `/v1/messages` — use an `ANTHROPIC_API_KEY` in that environment.
+**Recommended setup when running inside Claude Code:** the harness-provided OAuth token is scoped to Claude Code's own session endpoint and returns `401 Invalid bearer token` against `/v1/messages`. Use `--auth claude_cli` (or just rely on auto-detection — Beaver picks it over the harness OAuth). The CLI path spawns claude from `os.tmpdir()` with a tight system prompt to avoid loading project context that would otherwise trigger multi-turn tool use, keeping the call to ~3–10s.
 
 ## What a Report Contains
 

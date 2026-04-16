@@ -13,7 +13,7 @@ import { renderCli } from "../render/cli.js";
 import { renderMarkdown } from "../render/markdown.js";
 import { computeFrictionScore } from "../analysis/scoring.js";
 import { computeExpectedVsObserved } from "../analysis/expectations.js";
-import { createLLMClient, LLMConfigError } from "../analysis/llm-client.js";
+import { createClient, LLMConfigError } from "../analysis/llm-client.js";
 import { runLLMInsight } from "../analysis/llm-insight.js";
 
 const program = new Command();
@@ -46,7 +46,7 @@ program
   )
   .option(
     "--auth <mode>",
-    "Auth mode: auto | api_key | oauth (default: auto)",
+    "Auth mode: auto | api_key | oauth | claude_cli (default: auto)",
     "auto"
   )
   .option(
@@ -73,14 +73,14 @@ program
 
       if (options.llm) {
         try {
-          const client = createLLMClient({
+          const client = await createClient({
             apiKey: options.apiKey,
             authMode: options.auth,
             model: options.model,
             timeoutMs: options.llmTimeout,
           });
           process.stderr.write(
-            `[beaver] auth=${client.authMode} base=${client.baseUrl}\n`
+            `[beaver] auth=${client.authMode} endpoint=${client.baseUrl}\n`
           );
 
           // Feed the LLM the deterministic signals it needs to reason.
@@ -213,7 +213,7 @@ interface AnalyzeOptions {
   llm?: boolean;
   model?: string;
   apiKey?: string;
-  auth: "auto" | "api_key" | "oauth";
+  auth: "auto" | "api_key" | "oauth" | "claude_cli";
   llmTimeout: number;
 }
 
