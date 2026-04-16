@@ -102,19 +102,27 @@ The `examples/` folder contains sample sessions and their generated reports:
 |------|-------------|
 | `examples/example-session.json` | Synthetic session: agent fixing a login form validation bug |
 | `examples/example-report.md` | Generated report for the above |
-| `examples/beaver-build-session.jsonl` | Real Claude Code session: building Beaver itself |
+| `examples/beaver-build-session.jsonl` | Real Claude Code session: building Beaver v0.1 |
 | `examples/beaver-build-report.md` | Generated report for the above |
+| `examples/beaver-llm-upgrade-session.jsonl` | Real Claude Code session: building the v0.2 LLM-analysis upgrade itself |
+| `examples/beaver-llm-upgrade-report-heuristic.md` | Heuristic-only report for the v0.2 upgrade session |
+| `examples/beaver-llm-upgrade-report-hybrid.md` | LLM-enriched (hybrid) report for the same session |
 
 ```bash
 # Analyze the synthetic example
 beaver analyze examples/example-session.json
 
-# Analyze the real session (Beaver building itself)
-beaver analyze examples/beaver-build-session.jsonl
+# Analyze the v0.2 upgrade session — heuristic only
+beaver analyze examples/beaver-llm-upgrade-session.jsonl
+
+# Same session, with LLM enrichment (delegates to local `claude` CLI)
+beaver analyze examples/beaver-llm-upgrade-session.jsonl --llm
 
 # Output as markdown
 beaver analyze examples/example-session.json -f markdown -o report.md
 ```
+
+The `beaver-llm-upgrade-*` pair is a useful side-by-side: the same session rendered both ways. The heuristic report gives you the score and deltas; the hybrid report adds an LLM-authored TL;DR, identifies the README.md retry storm as a *mechanical Edit-tool mismatch* (not a reasoning failure), and recommends a concrete CLAUDE.md module map plus replacing Edit-based README updates with a generator script.
 
 The synthetic example session shows an agent that:
 - Explores 7+ files to find the validation logic
